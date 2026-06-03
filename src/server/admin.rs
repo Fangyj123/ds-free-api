@@ -75,6 +75,8 @@ pub struct DeepSeekConfigView {
     pub input_character_limits: Vec<u32>,
     pub model_aliases: Vec<String>,
     pub tool_call: ToolCallTagConfigView,
+    pub session_reuse_count: usize,
+    pub delete_session: bool,
 }
 
 #[derive(Serialize)]
@@ -132,6 +134,8 @@ fn mask_config(config: &Config) -> AdminConfigResponse {
                 extra_starts: config.deepseek.tool_call.extra_starts.clone(),
                 extra_ends: config.deepseek.tool_call.extra_ends.clone(),
             },
+            session_reuse_count: config.deepseek.session_reuse_count,
+            delete_session: config.deepseek.delete_session,
         },
         proxy: ProxyConfigView {
             url: config.proxy.url.clone(),
