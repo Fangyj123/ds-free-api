@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.7-pre5] - 2026-06-03
+
+### Added: Session 复用（edit_message）
+
+- 新增 `session_reuse_count` 配置（默认 1，即不复用），支持通过管理面板热重载
+- 新增 `delete_session` 配置（默认 true），弃用后是否删除 session
+- 复用模式下通过 edit_message 编辑第一条消息重新生成，使行为更接近正常网页端用户，降低风控触发概率
+- 新增 Dockerfile 支持本地多阶段构建
+
+---
+
 ## [0.2.7-pre1] - 2026-05-14
 
 ### Fix: 主要修复因为官方限制expert模型的上传文件导致的问题, 以及其他的一些修改
