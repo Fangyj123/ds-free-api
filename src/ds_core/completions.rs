@@ -625,7 +625,7 @@ impl Completions {
                 stop_id,
                 self.active_sessions.clone(),
                 self.reuse_pool.clone(),
-                account_id,
+                account_id.clone(),
                 self.delete_session.clone(),
             )),
             account_id,
@@ -1203,10 +1203,12 @@ impl Completions {
         };
 
         // 清理复用池中的 session
-        let reuse_sessions: Vec<_> = self
+        let reuse_sessions: Vec<(String, String)> = self
             .reuse_pool
-            .drain()
+            .iter()
+            .map(|entry| (entry.value().token.clone(), entry.value().session_id.clone()))
             .collect();
+        self.reuse_pool.clear();
 
         if sessions.is_empty() && reuse_sessions.is_empty() {
             self.pool.shutdown(&client).await;
@@ -1251,17 +1253,17 @@ impl Completions {
         let reuse_futures: Vec<_> = if delete {
             reuse_sessions
                 .into_iter()
-                .map(|(_, s)| {
+                .map(|(token, session_id)| {
                     let client = client.clone();
                     async move {
                         let _ = client
-                            .delete_session(&s.token, &s.session_id)
+                            .delete_session(&token, &session_id)
                             .await
                             .inspect_err(|e| {
                                 log::warn!(
                                     target: "ds_core::accounts",
                                     "shutdown 清理复用 session {} 失败: {}",
-                                    s.session_id, e
+                                    session_id, e
                                 );
                             });
                     }
