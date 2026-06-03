@@ -178,7 +178,7 @@ where
 }
 
 /// 可复用的 session 信息
-struct ReusableSession {
+pub(super) struct ReusableSession {
     session_id: String,
     token: String,
     request_message_id: i64,
