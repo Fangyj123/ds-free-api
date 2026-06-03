@@ -624,6 +624,9 @@ impl Completions {
                 session_id,
                 stop_id,
                 self.active_sessions.clone(),
+                self.reuse_pool.clone(),
+                account_id,
+                self.delete_session.clone(),
             )),
             account_id,
         })
@@ -1200,10 +1203,10 @@ impl Completions {
         };
 
         // 清理复用池中的 session
-        let reuse_sessions: Vec<_> = {
-            let pool = std::mem::take(&mut *self.reuse_pool.clone());
-            pool.into_iter().collect()
-        };
+        let reuse_sessions: Vec<_> = self
+            .reuse_pool
+            .drain()
+            .collect();
 
         if sessions.is_empty() && reuse_sessions.is_empty() {
             self.pool.shutdown(&client).await;
