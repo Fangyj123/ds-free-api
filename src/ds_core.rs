@@ -82,6 +82,8 @@ impl DeepSeekCore {
             pool,
             config.deepseek.model_types.clone(),
             config.deepseek.input_character_limits.clone(),
+            config.deepseek.session_reuse_count,
+            config.deepseek.delete_session,
         )
         .await;
 
@@ -130,5 +132,10 @@ impl DeepSeekCore {
 
     pub async fn reload_config(&self, config: &Config) -> Result<(), CoreError> {
         self.completions.reload_config(config).await
+    }
+
+    /// 热重载 session 复用设置
+    pub fn update_session_settings(&self, reuse_count: usize, delete: bool) {
+        self.completions.update_session_settings(reuse_count, delete);
     }
 }

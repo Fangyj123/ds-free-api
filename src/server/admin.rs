@@ -330,6 +330,11 @@ pub(crate) async fn admin_put_config(
 
     // Hot-reload: sync accounts from the new config
     state.adapter.sync_accounts(&new_config.accounts).await;
+    // Hot-reload: update session reuse settings
+    state.adapter.update_session_settings(
+        new_config.deepseek.session_reuse_count,
+        new_config.deepseek.delete_session,
+    );
     json_response(&serde_json::json!({"ok": true}))
 }
 

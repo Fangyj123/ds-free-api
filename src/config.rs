@@ -117,6 +117,13 @@ pub struct DeepSeekConfig {
     /// 则仅 deepseek-v4-pro → expert（index 1），空字符串被跳过
     #[serde(default)]
     pub model_aliases: Vec<String>,
+    /// Session 复用次数：1 = 不复用（每次新建 session），>1 = 复用 N 次后弃用
+    /// 复用时通过 edit_message 替换第一条消息重新生成，避免提示词污染
+    #[serde(default = "default_session_reuse_count")]
+    pub session_reuse_count: usize,
+    /// 弃用 session 后是否删除：true = 删除，false = 保留在 DeepSeek 网页端
+    #[serde(default = "default_delete_session")]
+    pub delete_session: bool,
 }
 
 /// 工具调用标签配置
@@ -174,6 +181,8 @@ impl Default for DeepSeekConfig {
             input_character_limits: default_input_character_limits(),
             tool_call: ToolCallTagConfig::default(),
             model_aliases: Vec::new(),
+            session_reuse_count: default_session_reuse_count(),
+            delete_session: default_delete_session(),
         }
     }
 }
@@ -196,6 +205,14 @@ fn default_max_output_tokens() -> Vec<u32> {
 
 fn default_input_character_limits() -> Vec<u32> {
     vec![2_621_440, 163_840, 2_621_440]
+}
+
+fn default_session_reuse_count() -> usize {
+    1
+}
+
+fn default_delete_session() -> bool {
+    true
 }
 
 impl DeepSeekConfig {

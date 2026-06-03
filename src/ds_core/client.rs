@@ -432,7 +432,6 @@ impl DsClient {
         Ok(Box::pin(resp.bytes_stream().map_err(ClientError::Http)))
     }
 
-    #[allow(dead_code)]
     pub async fn edit_message(
         &self,
         token: &str,

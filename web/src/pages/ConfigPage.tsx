@@ -449,6 +449,30 @@ export function ConfigPage() {
               onChange={(e) => update(['deepseek', 'client_locale'], e.target.value)}
             />
           </div>
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">Session Reuse Count</label>
+            <Input
+              type="number"
+              min={1}
+              value={config.deepseek.session_reuse_count}
+              onChange={(e) => update(['deepseek', 'session_reuse_count'], Math.max(1, parseInt(e.target.value) || 1))}
+            />
+            <p className="text-xs text-muted-foreground mt-1">1 = no reuse, &gt;1 = reuse session N times via edit_message</p>
+          </div>
+          <div>
+            <label className="text-sm text-muted-foreground block mb-1">Delete Session</label>
+            <div className="flex items-center gap-2 h-9">
+              <input
+                type="checkbox"
+                checked={config.deepseek.delete_session}
+                onChange={(e) => update(['deepseek', 'delete_session'], e.target.checked)}
+                className="h-4 w-4"
+              />
+              <span className="text-sm text-muted-foreground">
+                {config.deepseek.delete_session ? 'Delete on abandon' : 'Keep on DeepSeek'}
+              </span>
+            </div>
+          </div>
         </div>
       </Section>
 

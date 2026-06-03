@@ -78,6 +78,15 @@ password = "pass3"
 # 则仅 deepseek-v4-pro → expert（index 1），空字符串被跳过
 # model_aliases = []
 
+# Session 复用次数（默认 1，即不复用）
+# 设为 >1 时，同一 session 会复用 N 次（通过 edit_message 编辑第一条消息后重新生成），
+# 使行为更接近正常网页端用户，降低风控触发概率
+# session_reuse_count = 1
+
+# 弃用后是否删除 session（默认 true）
+# 设为 false 可保留 session 在 DeepSeek 网页端可见（更接近正常用户行为）
+# delete_session = true
+
 # 代理配置（可选，绕过 CloudFront WAF 地区限制）
 # 使用非美国地区的代理出口节点可避免 WAF Challenge
 # [proxy]

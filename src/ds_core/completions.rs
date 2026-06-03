@@ -5,17 +5,21 @@
 use crate::config::Config;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::sync::RwLock;
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::{Stream, StreamExt};
 use pin_project_lite::pin_project;
 
 use crate::ds_core::CoreError;
 use crate::ds_core::accounts::{AccountGuard, AccountPool};
-use crate::ds_core::client::{ClientError, CompletionPayload, DsClient, StopStreamPayload};
+use crate::ds_core::client::{
+    ClientError, CompletionPayload, DsClient, EditMessagePayload, StopStreamPayload,
+};
 use crate::ds_core::pow::PowSolver;
 
 pub(crate) struct ActiveSession {
@@ -63,6 +67,9 @@ pin_project! {
         message_id: i64,
         finished: bool,
         sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
+        reuse_pool: Arc<DashMap<String, ReusableSession>>,
+        account_id: String,
+        delete_session: Arc<AtomicBool>,
     }
 
     impl<S> PinnedDrop for GuardedStream<S> {
@@ -74,6 +81,9 @@ pin_project! {
             let message_id = *this.message_id;
             let finished = *this.finished;
             let sessions = this.sessions.clone();
+            let reuse_pool = this.reuse_pool.clone();
+            let account_id = this.account_id.clone();
+            let delete_session = this.delete_session.clone();
 
             // 从活跃 session 追踪中移除
             sessions.lock().unwrap().remove(&session_id);
@@ -89,9 +99,24 @@ pin_project! {
                         log::warn!(target: "ds_core::accounts", "stop_stream 失败: {}", e);
                     }
                 }
-                // 无论流是否完成，都清理临时 session
-                if let Err(e) = client.delete_session(&token, &session_id).await {
-                    log::warn!(target: "ds_core::accounts", "delete_session 失败: {}", e);
+                // 检查 session 是否在复用池中（正在被复用，不删除）
+                if reuse_pool.contains_key(&account_id) {
+                    log::debug!(
+                        target: "ds_core::accounts",
+                        "session {} 仍在复用池中，跳过删除", session_id
+                    );
+                    return;
+                }
+                // 不在复用池中，根据配置决定是否删除
+                if delete_session.load(Ordering::Relaxed) {
+                    if let Err(e) = client.delete_session(&token, &session_id).await {
+                        log::warn!(target: "ds_core::accounts", "delete_session 失败: {}", e);
+                    }
+                } else {
+                    log::debug!(
+                        target: "ds_core::accounts",
+                        "delete_session=false，保留 session: {}", session_id
+                    );
                 }
             });
         }
@@ -107,6 +132,9 @@ impl<S> GuardedStream<S> {
         session_id: String,
         message_id: i64,
         sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
+        reuse_pool: Arc<DashMap<String, ReusableSession>>,
+        account_id: String,
+        delete_session: Arc<AtomicBool>,
     ) -> Self {
         Self {
             stream,
@@ -117,6 +145,9 @@ impl<S> GuardedStream<S> {
             message_id,
             finished: false,
             sessions,
+            reuse_pool,
+            account_id,
+            delete_session,
         }
     }
 }
@@ -146,6 +177,14 @@ where
     }
 }
 
+/// 可复用的 session 信息
+struct ReusableSession {
+    session_id: String,
+    token: String,
+    request_message_id: i64,
+    use_count: usize,
+}
+
 pub struct Completions {
     client: RwLock<DsClient>,
     solver: RwLock<PowSolver>,
@@ -153,6 +192,12 @@ pub struct Completions {
     active_sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
     model_types: Vec<String>,
     input_character_limits: Vec<u32>,
+    /// Session 复用池：key = account_id，每个账号最多一个可复用 session
+    reuse_pool: Arc<DashMap<String, ReusableSession>>,
+    /// Session 复用次数（1 = 不复用）
+    session_reuse_count: Arc<AtomicUsize>,
+    /// 弃用后是否删除 session
+    delete_session: Arc<AtomicBool>,
 }
 
 impl Completions {
@@ -162,6 +207,8 @@ impl Completions {
         pool: AccountPool,
         model_types: Vec<String>,
         input_character_limits: Vec<u32>,
+        session_reuse_count: usize,
+        delete_session: bool,
     ) -> Self {
         let pool = Arc::new(pool);
         // 存储 client/solver 供后台恢复任务使用
@@ -175,7 +222,25 @@ impl Completions {
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
             model_types,
             input_character_limits,
+            reuse_pool: Arc::new(DashMap::new()),
+            session_reuse_count: Arc::new(AtomicUsize::new(session_reuse_count)),
+            delete_session: Arc::new(AtomicBool::new(delete_session)),
         }
+    }
+
+    /// 热重载 session 复用设置（admin 面板调用）
+    pub fn update_session_settings(&self, reuse_count: usize, delete: bool) {
+        let old_count = self.session_reuse_count.swap(reuse_count, Ordering::Relaxed);
+        self.delete_session.store(delete, Ordering::Relaxed);
+        // 如果复用次数减小，清理超出新上限的 session
+        if reuse_count < old_count {
+            self.reuse_pool.retain(|_, s| s.use_count < reuse_count);
+        }
+        log::info!(
+            target: "ds_core::accounts",
+            "session 复用设置已更新: reuse_count={}, delete={}",
+            reuse_count, delete
+        );
     }
 
     /// 获取指定 model_type 的 input_character_limit
@@ -565,6 +630,9 @@ impl Completions {
     }
 
     /// 单次请求尝试（不含重试逻辑）
+    ///
+    /// 当 session_reuse_count > 1 且无文件上传时，优先复用已有 session（edit_message）。
+    /// 否则创建新 session 走正常 completion 流程。
     async fn v0_chat_once(
         &self,
         req: &ChatRequest,
@@ -598,11 +666,151 @@ impl Completions {
         );
 
         let client = self.client.read().await.clone();
-        // 3. 创建临时 session
+        let reuse_count = self.session_reuse_count.load(Ordering::Relaxed);
+
+        // 2. 检查是否可以复用 session（无文件上传 + 复用次数 > 1 + 池中有可用 session）
+        let can_reuse = reuse_count > 1
+            && req.files.is_empty()
+            && history_content.is_empty();
+
+        if can_reuse {
+            // 尝试从复用池获取并移除（成功后重新插入或丢弃）
+            if let Some((_, reusable)) = self.reuse_pool.remove(&account_id) {
+                if reusable.use_count < reuse_count {
+                    log::debug!(
+                        target: "ds_core::accounts",
+                        "req={} 复用 session: id={}, use_count={}/{}",
+                        request_id, reusable.session_id, reusable.use_count, reuse_count
+                    );
+
+                    // 计算 PoW（edit_message 专用路径）
+                    let pow_header = match self
+                        .compute_pow_for_target(&reusable.token, "/api/v0/chat/edit_message")
+                        .await
+                    {
+                        Ok(h) => h,
+                        Err(e) => {
+                            self.pool.mark_error(&account_id);
+                            return Err(e);
+                        }
+                    };
+
+                    let payload = EditMessagePayload {
+                        chat_session_id: reusable.session_id.clone(),
+                        message_id: reusable.request_message_id,
+                        prompt: req.prompt.clone(),
+                        search_enabled: req.search_enabled,
+                        thinking_enabled: req.thinking_enabled,
+                        model_type: req.model_type.clone(),
+                    };
+
+                    let mut raw_stream =
+                        match client.edit_message(&reusable.token, &pow_header, &payload).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log::warn!(
+                                    target: "ds_core::accounts",
+                                    "req={} edit_message 失败，移除复用 session: {}",
+                                    request_id, e
+                                );
+                                self.pool.mark_error(&account_id);
+                                return Err(e.into());
+                            }
+                        };
+
+                    // 解析 SSE（与 completion 相同格式）
+                    let result = self
+                        .parse_sse_events(&mut raw_stream, request_id, &account_id)
+                        .await;
+
+                    let (buf, stop_id) = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // edit_message 失败，删除 session 并标记账号
+                            log::warn!(
+                                target: "ds_core::accounts",
+                                "req={} 复用 session SSE 解析失败，删除 session: {}",
+                                request_id, e
+                            );
+                            let _ = client.delete_session(&reusable.token, &reusable.session_id).await;
+                            self.pool.mark_error(&account_id);
+                            return Err(e);
+                        }
+                    };
+
+                    // 更新复用计数
+                    let new_count = reusable.use_count + 1;
+                    if new_count < reuse_count {
+                        // 放回池中
+                        self.reuse_pool.insert(
+                            account_id.clone(),
+                            ReusableSession {
+                                session_id: reusable.session_id.clone(),
+                                token: reusable.token.clone(),
+                                request_message_id: reusable.request_message_id,
+                                use_count: new_count,
+                            },
+                        );
+                        log::debug!(
+                            target: "ds_core::accounts",
+                            "req={} session {} 放回复用池: use_count={}/{}",
+                            request_id, reusable.session_id, new_count, reuse_count
+                        );
+                    } else {
+                        log::debug!(
+                            target: "ds_core::accounts",
+                            "req={} session {} 达到复用上限，弃用",
+                            request_id, reusable.session_id
+                        );
+                    }
+
+                    // 注册活跃 session
+                    {
+                        let mut map = self.active_sessions.lock().unwrap();
+                        map.insert(
+                            reusable.session_id.clone(),
+                            ActiveSession {
+                                token: reusable.token.clone(),
+                                session_id: reusable.session_id.clone(),
+                                message_id: stop_id,
+                            },
+                        );
+                    }
+
+                    let stream = futures::stream::once(futures::future::ready(Ok(Bytes::from(
+                        buf,
+                    ))))
+                    .chain(raw_stream);
+
+                    return Ok(ChatResponse {
+                        stream: Box::pin(GuardedStream::new(
+                            Box::pin(stream),
+                            guard,
+                            client.clone(),
+                            reusable.token,
+                            reusable.session_id,
+                            stop_id,
+                            self.active_sessions.clone(),
+                            self.reuse_pool.clone(),
+                            account_id.clone(),
+                            self.delete_session.clone(),
+                        )),
+                        account_id,
+                    });
+                }
+                // use_count >= reuse_count，不复用，走正常流程
+                log::debug!(
+                    target: "ds_core::accounts",
+                    "req={} session {} 已达复用上限，走新建流程",
+                    request_id, reusable.session_id
+                );
+            }
+        }
+
+        // 3. 正常流程：创建 session
         let session_id = match client.create_session(&token).await {
             Ok(id) => id,
             Err(e) => {
-                // 认证/网络错误 → 标记账号 Error
                 self.pool.mark_error(&account_id);
                 return Err(e.into());
             }
@@ -614,7 +822,6 @@ impl Completions {
 
         // 4. 上传文件：先历史文件，再外部文件（对话阅读顺序）
         let mut ref_file_ids: Vec<String> = Vec::new();
-        // 历史文件上传失败时退回到完整 prompt 内联发送
         let mut history_upload_failed = false;
 
         if !history_content.is_empty() {
@@ -680,7 +887,7 @@ impl Completions {
             "req={} completion PoW 计算完成", request_id
         );
 
-        // 6. 发起 completion（历史文件上传失败时退回到完整 prompt 内联发送）
+        // 6. 发起 completion
         let completion_prompt: &str = if history_upload_failed {
             &req.prompt
         } else {
@@ -712,7 +919,78 @@ impl Completions {
             }
         };
 
-        // 7. 收集字节直到拿到前两个 SSE 事件（ready + hint/update_session）
+        // 7. 解析 SSE 事件
+        let (buf, stop_id) = match self
+            .parse_sse_events(&mut raw_stream, request_id, &account_id)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = client.delete_session(&token, &session_id).await;
+                return Err(e);
+            }
+        };
+
+        // 8. 如果启用了 session 复用，存入复用池
+        if reuse_count > 1 && req.files.is_empty() && history_content.is_empty() {
+            let (req_msg_id, _) = parse_ready_message_ids(&buf);
+            self.reuse_pool.insert(
+                account_id.clone(),
+                ReusableSession {
+                    session_id: session_id.clone(),
+                    token: token.clone(),
+                    request_message_id: req_msg_id,
+                    use_count: 1,
+                },
+            );
+            log::debug!(
+                target: "ds_core::accounts",
+                "req={} session {} 存入复用池: request_msg_id={}, reuse_count={}",
+                request_id, session_id, req_msg_id, reuse_count
+            );
+        }
+
+        // 9. 注册活跃 session
+        {
+            let mut map = self.active_sessions.lock().unwrap();
+            map.insert(
+                session_id.clone(),
+                ActiveSession {
+                    token: token.clone(),
+                    session_id: session_id.clone(),
+                    message_id: stop_id,
+                },
+            );
+        }
+
+        // 10. 用原始 buf 重建流
+        let stream =
+            futures::stream::once(futures::future::ready(Ok(Bytes::from(buf)))).chain(raw_stream);
+
+        Ok(ChatResponse {
+            stream: Box::pin(GuardedStream::new(
+                Box::pin(stream),
+                guard,
+                client.clone(),
+                token,
+                session_id,
+                stop_id,
+                self.active_sessions.clone(),
+                self.reuse_pool.clone(),
+                account_id.clone(),
+                self.delete_session.clone(),
+            )),
+            account_id,
+        })
+    }
+
+    /// 解析 SSE 流的前两个事件（ready + hint/update_session），处理 biz_code 和 hint 错误
+    async fn parse_sse_events(
+        &self,
+        raw_stream: &mut Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>,
+        request_id: &str,
+        account_id: &str,
+    ) -> Result<(Vec<u8>, i64), CoreError> {
         let mut buf = Vec::new();
         let mut text_buf = String::new();
         let (ready_block, second_block) = loop {
@@ -721,7 +999,6 @@ impl Completions {
                 .await
                 .ok_or_else(|| {
                     let raw = String::from_utf8_lossy(&buf);
-                    // 检查是否为 biz_code 业务错误（如 mute 返回纯 JSON 而非 SSE）
                     if let Some(biz_code) = raw
                         .lines()
                         .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -740,7 +1017,7 @@ impl Completions {
                             "req={} SSE 流返回业务错误: biz_code={}, biz_msg={}",
                             request_id, biz_code, biz_msg
                         );
-                        self.pool.mark_error(&account_id);
+                        self.pool.mark_error(account_id);
                         return CoreError::ProviderError(format!(
                             "biz_code={}, {}",
                             biz_code, biz_msg
@@ -755,7 +1032,10 @@ impl Completions {
                 .map_err(|e| CoreError::Stream(e.to_string()))?;
             log::trace!(
                 target: "ds_core::accounts",
-                "req={} <<< ({} bytes) {}", request_id, chunk.len(), String::from_utf8_lossy(&chunk)
+                "req={} <<< ({} bytes) {}",
+                request_id,
+                chunk.len(),
+                String::from_utf8_lossy(&chunk)
             );
             buf.extend_from_slice(&chunk);
             text_buf.push_str(&String::from_utf8_lossy(&chunk));
@@ -767,15 +1047,14 @@ impl Completions {
 
         let (_, stop_id) = parse_ready_message_ids(ready_block.as_bytes());
 
-        // 8. 检查 hint 事件（rate_limit / input_exceeds_limit）
+        // 检查 hint 事件（rate_limit / input_exceeds_limit）
         if let Some(err) = check_hint(&second_block) {
             if let CoreError::Overloaded = &err {
                 log::warn!(
                     target: "ds_core::accounts",
                     "req={} hint 限流: rate_limit_reached", request_id
                 );
-                // rate_limit 是账号级限流，标记 Error 触发换号重试
-                self.pool.mark_error(&account_id);
+                self.pool.mark_error(account_id);
             } else {
                 let hint_detail = second_block
                     .lines()
@@ -792,11 +1071,6 @@ impl Completions {
                     "req={} hint 错误: {}", request_id, hint_detail
                 );
             }
-            let _ = client.delete_session(&token, &session_id).await;
-            log::debug!(
-                target: "ds_core::accounts",
-                "req={} hint 后清理 session: id={}", request_id, session_id
-            );
             return Err(err);
         }
 
@@ -805,35 +1079,7 @@ impl Completions {
             "req={} SSE ready: resp_msg={}", request_id, stop_id
         );
 
-        // 9. 注册活跃 session（含 message_id 用于 stop_stream）
-        {
-            let mut map = self.active_sessions.lock().unwrap();
-            map.insert(
-                session_id.clone(),
-                ActiveSession {
-                    token: token.clone(),
-                    session_id: session_id.clone(),
-                    message_id: stop_id,
-                },
-            );
-        }
-
-        // 10. 用原始 buf 重建流（包含已消耗的 chunk）
-        let stream =
-            futures::stream::once(futures::future::ready(Ok(Bytes::from(buf)))).chain(raw_stream);
-
-        Ok(ChatResponse {
-            stream: Box::pin(GuardedStream::new(
-                Box::pin(stream),
-                guard,
-                client.clone(),
-                token,
-                session_id,
-                stop_id,
-                self.active_sessions.clone(),
-            )),
-            account_id,
-        })
+        Ok((buf, stop_id))
     }
 
     async fn compute_pow_for_target(
@@ -953,18 +1199,27 @@ impl Completions {
             std::mem::take(&mut *map)
         };
 
-        if sessions.is_empty() {
+        // 清理复用池中的 session
+        let reuse_sessions: Vec<_> = {
+            let pool = std::mem::take(&mut *self.reuse_pool.clone());
+            pool.into_iter().collect()
+        };
+
+        if sessions.is_empty() && reuse_sessions.is_empty() {
             self.pool.shutdown(&client).await;
             return;
         }
 
         log::info!(
             target: "ds_core::accounts",
-            "shutdown: 清理 {} 个残留 session", sessions.len()
+            "shutdown: 清理 {} 个活跃 session, {} 个复用 session",
+            sessions.len(), reuse_sessions.len()
         );
 
         use futures::future::join_all;
-        let futures: Vec<_> = sessions
+
+        // 清理活跃 session
+        let active_futures: Vec<_> = sessions
             .into_values()
             .map(|s| {
                 let client = client.clone();
@@ -980,14 +1235,46 @@ impl Completions {
                         .inspect_err(|e| {
                             log::warn!(
                                 target: "ds_core::accounts",
-                                "shutdown 清理 session {} 失败: {}",
+                                "shutdown 清理活跃 session {} 失败: {}",
                                 s.session_id, e
                             );
                         });
                 }
             })
             .collect();
-        join_all(futures).await;
+
+        // 清理复用池中的 session（根据 delete_session 配置）
+        let delete = self.delete_session.load(Ordering::Relaxed);
+        let reuse_futures: Vec<_> = if delete {
+            reuse_sessions
+                .into_iter()
+                .map(|(_, s)| {
+                    let client = client.clone();
+                    async move {
+                        let _ = client
+                            .delete_session(&s.token, &s.session_id)
+                            .await
+                            .inspect_err(|e| {
+                                log::warn!(
+                                    target: "ds_core::accounts",
+                                    "shutdown 清理复用 session {} 失败: {}",
+                                    s.session_id, e
+                                );
+                            });
+                    }
+                })
+                .collect()
+        } else {
+            log::info!(
+                target: "ds_core::accounts",
+                "shutdown: delete_session=false，保留 {} 个复用 session",
+                reuse_sessions.len()
+            );
+            Vec::new()
+        };
+
+        join_all(active_futures).await;
+        join_all(reuse_futures).await;
 
         self.pool.shutdown(&client).await;
     }

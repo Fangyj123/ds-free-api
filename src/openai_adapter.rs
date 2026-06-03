@@ -328,6 +328,11 @@ impl OpenAIAdapter {
     pub async fn re_login_single(&self, email_or_mobile: &str) -> Result<(), String> {
         self.ds_core.re_login_single(email_or_mobile).await
     }
+
+    /// 热重载 session 复用设置
+    pub fn update_session_settings(&self, reuse_count: usize, delete: bool) {
+        self.ds_core.update_session_settings(reuse_count, delete);
+    }
 }
 
 impl OpenAIAdapter {
